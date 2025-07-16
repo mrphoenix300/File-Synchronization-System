@@ -1,0 +1,2 @@
+fullpathXXX/config_source_dir1 fullpathXXX/config_target_dir1
+fullpathXXX/config_source_dir2 fullpathXXX/config_target_dir2
