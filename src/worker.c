@@ -34,6 +34,18 @@ static void record_error(SyncReport *report, const char *kind,
     report->error_count++;
 }
 
+/* Single-file events must stay within the configured directories. */
+static int valid_filename(const char *name) {
+    return name[0] != '\0' && strcmp(name, ".") != 0 &&
+           strcmp(name, "..") != 0 && strchr(name, '/') == NULL;
+}
+
+static int make_file_path(char *out, size_t size,
+                          const char *dir, const char *name) {
+    int n = snprintf(out, size, "%s/%s", dir, name);
+    return n >= 0 && (size_t)n < size;
+}
+
 void copy_file(const char *src, const char *dest, SyncReport *report);
 void full_sync(const char *source, const char *target, SyncReport *report);
 void generate_report(const SyncReport *report, const char *operation, const char *filename);
@@ -56,8 +68,13 @@ int main(int argc, char *argv[]) {
         full_sync(argv[1], argv[2], &report);
     } else { // single file operation
         char src_path[PATH_MAX], dest_path[PATH_MAX];
-        snprintf(src_path, PATH_MAX, "%s/%s", argv[1], argv[3]);
-        snprintf(dest_path, PATH_MAX, "%s/%s", argv[2], argv[3]);
+        if (!valid_filename(argv[3]) ||
+            !make_file_path(src_path, sizeof(src_path), argv[1], argv[3]) ||
+            !make_file_path(dest_path, sizeof(dest_path), argv[2], argv[3])) {
+            record_error(&report, "Invalid filename or path", argv[3], EINVAL);
+            generate_report(&report, operation, argv[3]);
+            return EXIT_FAILURE;
+        }
 
         if (strcmp(operation, "DELETED") == 0) { // delete operation
             if (unlink(dest_path) == -1) { // try remove
@@ -74,18 +91,33 @@ int main(int argc, char *argv[]) {
 
  /* The meat - copy file contents */
 void copy_file(const char *src, const char *dest, SyncReport *report) {
-    int src_fd = open(src, O_RDONLY);
+    int src_fd = open(src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (src_fd == -1) {
         record_error(report, "Open failed", src, errno);
         if (report->error_count >= MAX_ERRORS) return;
         return;
     }
 
-    int dest_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644); // rw-r--r--
+    struct stat src_stat;
+    if (fstat(src_fd, &src_stat) == -1 || !S_ISREG(src_stat.st_mode)) {
+        record_error(report, "Source is not a regular file", src, EINVAL);
+        close(src_fd);
+        return;
+    }
+
+    int dest_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_NONBLOCK, 0644); // rw-r--r--
     if (dest_fd == -1) {
         record_error(report, "Create failed", dest, errno);
         close(src_fd);
         if (report->error_count >= MAX_ERRORS) return;
+        return;
+    }
+
+    struct stat dest_stat;
+    if (fstat(dest_fd, &dest_stat) == -1 || !S_ISREG(dest_stat.st_mode)) {
+        record_error(report, "Destination is not a regular file", dest, EINVAL);
+        close(src_fd);
+        close(dest_fd);
         return;
     }
 
@@ -124,9 +156,15 @@ void full_sync(const char *source, const char *target, SyncReport *report) {
         if (entry->d_type != DT_REG) continue; // skip dirs/symlinks
         
         char src_path[PATH_MAX], dest_path[PATH_MAX];
-        snprintf(src_path, PATH_MAX, "%s/%s", source, entry->d_name);
-        snprintf(dest_path, PATH_MAX, "%s/%s", target, entry->d_name);
-        
+        if (!valid_filename(entry->d_name) ||
+            !make_file_path(src_path, sizeof(src_path), source, entry->d_name) ||
+            !make_file_path(dest_path, sizeof(dest_path), target, entry->d_name)) {
+            record_error(report, "Invalid filename or path", entry->d_name, EINVAL);
+            report->files_skipped++;
+            if (report->error_count >= MAX_ERRORS) break;
+            continue;
+        }
+
         int prev_errors = report->error_count;
         copy_file(src_path, dest_path, report);
         
