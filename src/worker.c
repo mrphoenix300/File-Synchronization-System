@@ -23,6 +23,17 @@ typedef struct {
     int error_count;
 } SyncReport;
 
+/* Never write beyond the fixed-size error report. */
+static void record_error(SyncReport *report, const char *kind,
+                         const char *path, int error_number) {
+    if (report->error_count >= MAX_ERRORS) return;
+
+    snprintf(report->errors[report->error_count], ERROR_MSG_SIZE,
+             "%s: %.*s (%.*s)", kind, PATH_TRUNC, path,
+             ERR_TRUNC, strerror(error_number));
+    report->error_count++;
+}
+
 void copy_file(const char *src, const char *dest, SyncReport *report);
 void full_sync(const char *source, const char *target, SyncReport *report);
 void generate_report(const SyncReport *report, const char *operation, const char *filename);
@@ -50,12 +61,7 @@ int main(int argc, char *argv[]) {
 
         if (strcmp(operation, "DELETED") == 0) { // delete operation
             if (unlink(dest_path) == -1) { // try remove
-                char err_buf[128];
-                strerror_r(errno, err_buf, sizeof(err_buf));
-                snprintf(report.errors[report.error_count++], ERROR_MSG_SIZE,
-                       "Delete failed: %.*s (%.*s)",
-                       PATH_TRUNC, dest_path,
-                       ERR_TRUNC, err_buf);
+                record_error(&report, "Delete failed", dest_path, errno);
             }
         } else { // copy/update
             copy_file(src_path, dest_path, &report);
@@ -70,24 +76,14 @@ int main(int argc, char *argv[]) {
 void copy_file(const char *src, const char *dest, SyncReport *report) {
     int src_fd = open(src, O_RDONLY);
     if (src_fd == -1) {
-        char err_buf[128];
-        strerror_r(errno, err_buf, sizeof(err_buf));
-        snprintf(report->errors[report->error_count++], ERROR_MSG_SIZE,
-               "Open failed: %.*s (%.*s)", 
-               PATH_TRUNC, src, 
-               ERR_TRUNC, err_buf);
+        record_error(report, "Open failed", src, errno);
         if (report->error_count >= MAX_ERRORS) return;
         return;
     }
 
     int dest_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0644); // rw-r--r--
     if (dest_fd == -1) {
-        char err_buf[128];
-        strerror_r(errno, err_buf, sizeof(err_buf));
-        snprintf(report->errors[report->error_count++], ERROR_MSG_SIZE,
-               "Create failed: %.*s (%.*s)", 
-               PATH_TRUNC, dest, 
-               ERR_TRUNC, err_buf);
+        record_error(report, "Create failed", dest, errno);
         close(src_fd);
         if (report->error_count >= MAX_ERRORS) return;
         return;
@@ -100,12 +96,7 @@ void copy_file(const char *src, const char *dest, SyncReport *report) {
         bytes_written = write(dest_fd, buffer, bytes_read);
         // printf("Copied %zd bytes...\n", bytes_out);  // debug
         if (bytes_written != bytes_read) { // write mismatch
-            char err_buf[128];
-            strerror_r(errno, err_buf, sizeof(err_buf));
-            snprintf(report->errors[report->error_count++], ERROR_MSG_SIZE,
-                   "Write failed: %.*s (%.*s)",
-                   PATH_TRUNC, dest,
-                   ERR_TRUNC, err_buf);
+            record_error(report, "Write failed", dest, errno);
             if (report->error_count >= MAX_ERRORS) break;
         }
     }
@@ -114,12 +105,7 @@ void copy_file(const char *src, const char *dest, SyncReport *report) {
     close(dest_fd); // cleanup
     
     if (bytes_read == -1) { 
-        char err_buf[128];
-        strerror_r(errno, err_buf, sizeof(err_buf));
-        snprintf(report->errors[report->error_count++], ERROR_MSG_SIZE,
-               "Read failed: %.*s (%.*s)",
-               PATH_TRUNC, src,
-               ERR_TRUNC, err_buf);
+        record_error(report, "Read failed", src, errno);
     } else if (bytes_written >= 0) {
         report->files_copied++; // increment only if no errors
     }
@@ -129,12 +115,7 @@ void copy_file(const char *src, const char *dest, SyncReport *report) {
 void full_sync(const char *source, const char *target, SyncReport *report) {
     DIR *dir = opendir(source);
     if (!dir) {
-        char err_buf[128];
-        strerror_r(errno, err_buf, sizeof(err_buf));
-        snprintf(report->errors[report->error_count++], ERROR_MSG_SIZE,
-               "Dir open failed: %.*s (%.*s)",
-               PATH_TRUNC, source,
-               ERR_TRUNC, err_buf);
+        record_error(report, "Dir open failed", source, errno);
         return;
     }
 
@@ -165,7 +146,7 @@ void generate_report(const SyncReport *report, const char *operation, const char
     const char *status;
     if (report->error_count == 0) {
         status = "SUCCESS";
-    } else if (report->files_copied > 0 || report->files_skipped < report->error_count) {
+    } else if (report->files_copied > 0) {
         status = "PARTIAL";
     } else {
         status = "ERROR";
