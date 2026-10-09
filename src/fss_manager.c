@@ -110,7 +110,7 @@ int main(int argc, char *argv[]) {
         // Handle incoming commands
         if (FD_ISSET(fss_in, &read_fds)) {
             char cmd[256];
-            ssize_t bytes = read(fss_in, cmd, sizeof(cmd));
+            ssize_t bytes = read(fss_in, cmd, sizeof(cmd) - 1);
             if (bytes > 0) {
                 cmd[bytes] = '\0';
                 handle_command(cmd);
