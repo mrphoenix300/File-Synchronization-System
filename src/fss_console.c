@@ -187,9 +187,22 @@ int open_pipes() {
 
 /* Send command through pipe */
 int send_command(const char *command) {
-    ssize_t bytes_written = write(pipe_in_fd, command, strlen(command));
-    if (bytes_written == -1) {
-        perror("Error writing to pipe");
+    // Newline frames each command so the manager never parses partial reads.
+    size_t length = strlen(command);
+    char *message = malloc(length + 2);
+    if (!message) {
+        perror("malloc");
+        return -1;
+    }
+    memcpy(message, command, length);
+    message[length] = '\n';
+    message[length + 1] = '\0';
+
+    // Keep each command in a single FIFO write (up to PIPE_BUF).
+    ssize_t bytes_written = write(pipe_in_fd, message, length + 1);
+    free(message);
+    if (bytes_written != (ssize_t)(length + 1)) {
+        perror("Error writing command to pipe");
         return -1;
     }
     return 0;
