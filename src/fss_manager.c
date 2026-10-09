@@ -107,13 +107,33 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Handle incoming commands
+        // Read newline-delimited commands; discard oversized lines as one unit.
         if (FD_ISSET(fss_in, &read_fds)) {
-            char cmd[256];
-            ssize_t bytes = read(fss_in, cmd, sizeof(cmd) - 1);
-            if (bytes > 0) {
-                cmd[bytes] = '\0';
-                handle_command(cmd);
+            static char cmd[256];
+            static size_t cmd_len = 0;
+            static int discarding = 0;
+            char input[4096];
+            ssize_t bytes = read(fss_in, input, sizeof(input));
+
+            for (ssize_t i = 0; i < bytes; i++) {
+                char ch = input[i];
+                if (ch == '\n') {
+                    if (discarding) {
+                        const char response[] = "Command too long (maximum 255 bytes)\n";
+                        write(fss_out, response, sizeof(response) - 1);
+                    } else if (cmd_len > 0) {
+                        cmd[cmd_len] = '\0';
+                        handle_command(cmd);
+                    }
+                    cmd_len = 0;
+                    discarding = 0;
+                } else if (!discarding) {
+                    if (cmd_len < sizeof(cmd) - 1) {
+                        cmd[cmd_len++] = ch;
+                    } else {
+                        discarding = 1;
+                    }
+                }
             }
         }
 
