@@ -209,9 +209,23 @@ void copy_file(int source_dirfd, int target_dirfd, const char *filename,
     }
 
     int copy_error = 0;
+    /* Match the previous copy behavior: existing mode or 0644 for new files. */
+    mode_t mode = 0644;
+    if (fstatat(target_dirfd, filename, &dest_stat, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISREG(dest_stat.st_mode))
+        mode = dest_stat.st_mode & 0777;
+    if (fchmod(temp_fd, mode) < 0) copy_error = errno;
+
     char buffer[BUFFER_SIZE];
     ssize_t bytes_read;
-    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
+    while (!copy_error) {
+        bytes_read = read(src_fd, buffer, sizeof(buffer));
+        if (bytes_read == 0) break;
+        if (bytes_read < 0) {
+            if (errno == EINTR) continue;
+            copy_error = errno;
+            break;
+        }
         size_t offset = 0;
         while (offset < (size_t)bytes_read) {
             ssize_t written = write(temp_fd, buffer + offset,
@@ -227,7 +241,6 @@ void copy_file(int source_dirfd, int target_dirfd, const char *filename,
         }
         if (copy_error) break;
     }
-    if (bytes_read < 0 && !copy_error) copy_error = errno;
 
     /* Finish writing the new contents before replacing the old file. */
     if (!copy_error && fsync(temp_fd) < 0) copy_error = errno;
