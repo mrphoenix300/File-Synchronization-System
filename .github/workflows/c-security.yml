@@ -1,0 +1,73 @@
+name: C build and security smoke tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build with compiler warnings and AddressSanitizer
+        run: |
+          make clean
+          make CFLAGS="-Wall -Wextra -g -fsanitize=address -fno-omit-frame-pointer -Iinclude" LDFLAGS="-fsanitize=address"
+
+      - name: Worker security smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          testdir="$(mktemp -d)"
+          trap 'rm -rf "$testdir"' EXIT
+          mkdir -p "$testdir/source" "$testdir/target"
+          printf 'NEW CONTENT\n' > "$testdir/source/test.txt"
+          printf 'OLD CONTENT\n' > "$testdir/target/test.txt"
+
+          # Successful overwrite must be complete and leave no temp files.
+          ./bin/worker "$testdir/source" "$testdir/target" test.txt MODIFIED > "$testdir/result"
+          grep -qx 'STATUS: SUCCESS' "$testdir/result"
+          grep -qx 'NEW CONTENT' "$testdir/target/test.txt"
+          if find "$testdir/target" -name '.fss-tmp-*' | grep -q .; then
+            echo 'Temporary files left behind' >&2
+            exit 1
+          fi
+
+          # A missing source must not destroy the existing target.
+          printf 'IMPORTANT DATA\n' > "$testdir/target/protected.txt"
+          if ./bin/worker "$testdir/source" "$testdir/target" protected.txt MODIFIED > "$testdir/result"; then
+            echo 'Missing source unexpectedly succeeded' >&2
+            exit 1
+          fi
+          grep -qx 'STATUS: ERROR' "$testdir/result"
+          grep -qx 'IMPORTANT DATA' "$testdir/target/protected.txt"
+
+          # Symlinks and traversal filenames must be rejected.
+          printf 'DO NOT CHANGE\n' > "$testdir/outside.txt"
+          printf 'ATTACK\n' > "$testdir/source/link.txt"
+          ln -s "$testdir/outside.txt" "$testdir/target/link.txt"
+          if ./bin/worker "$testdir/source" "$testdir/target" link.txt MODIFIED > "$testdir/result"; then
+            echo 'Destination symlink unexpectedly succeeded' >&2
+            exit 1
+          fi
+          grep -qx 'DO NOT CHANGE' "$testdir/outside.txt"
+          if ./bin/worker "$testdir/source" "$testdir/target" ../outside.txt MODIFIED > "$testdir/result"; then
+            echo 'Path traversal unexpectedly succeeded' >&2
+            exit 1
+          fi
+          grep -qx 'STATUS: ERROR' "$testdir/result"
+
+          # Parent-directory symlinks must not redirect writes.
+          ln -s "$testdir/target" "$testdir/target-link"
+          if ./bin/worker "$testdir/source" "$testdir/target-link" test.txt MODIFIED > "$testdir/result"; then
+            echo 'Directory symlink unexpectedly succeeded' >&2
+            exit 1
+          fi
+          grep -qx 'STATUS: ERROR' "$testdir/result"
