@@ -162,57 +162,97 @@ int main(int argc, char *argv[]) {
  /* The meat - copy file contents */
 void copy_file(int source_dirfd, int target_dirfd, const char *filename,
                const char *src, const char *dest, SyncReport *report) {
-    int src_fd = openat(source_dirfd, filename, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-    if (src_fd == -1) {
+    int src_fd = openat(source_dirfd, filename,
+                        O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (src_fd < 0) {
         record_error(report, "Open failed", src, errno);
-        if (report->error_count >= MAX_ERRORS) return;
         return;
     }
 
     struct stat src_stat;
-    if (fstat(src_fd, &src_stat) == -1 || !S_ISREG(src_stat.st_mode)) {
+    if (fstat(src_fd, &src_stat) != 0 || !S_ISREG(src_stat.st_mode)) {
         record_error(report, "Source is not a regular file", src, EINVAL);
         close(src_fd);
         return;
     }
 
-    int dest_fd = openat(target_dirfd, filename,
-                         O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0644); // rw-r--r--
-    if (dest_fd == -1) {
-        record_error(report, "Create failed", dest, errno);
-        close(src_fd);
-        if (report->error_count >= MAX_ERRORS) return;
-        return;
-    }
-
+    /* Reject non-regular destinations, including symbolic links. */
     struct stat dest_stat;
-    if (fstat(dest_fd, &dest_stat) == -1 || !S_ISREG(dest_stat.st_mode)) {
-        record_error(report, "Destination is not a regular file", dest, EINVAL);
+    if (fstatat(target_dirfd, filename, &dest_stat, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (!S_ISREG(dest_stat.st_mode)) {
+            record_error(report, "Destination is not a regular file", dest, EINVAL);
+            close(src_fd);
+            return;
+        }
+    } else if (errno != ENOENT) {
+        record_error(report, "Destination check failed", dest, errno);
         close(src_fd);
-        close(dest_fd);
         return;
     }
 
+    /* Write to an exclusive temporary file in the destination directory. */
+    char temp_name[80];
+    int temp_fd = -1;
+    static unsigned long sequence = 0;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        snprintf(temp_name, sizeof(temp_name), ".fss-tmp-%ld-%lu",
+                 (long)getpid(), sequence++);
+        temp_fd = openat(target_dirfd, temp_name,
+                         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                         0600);
+        if (temp_fd >= 0 || errno != EEXIST) break;
+    }
+    if (temp_fd < 0) {
+        record_error(report, "Temporary file creation failed", dest, errno);
+        close(src_fd);
+        return;
+    }
+
+    int copy_error = 0;
     char buffer[BUFFER_SIZE];
-    ssize_t bytes_read, bytes_written;
-    
-    while ((bytes_read = read(src_fd, buffer, BUFFER_SIZE)) > 0) { // read chunks
-        bytes_written = write(dest_fd, buffer, bytes_read);
-        // printf("Copied %zd bytes...\n", bytes_out);  // debug
-        if (bytes_written != bytes_read) { // write mismatch
-            record_error(report, "Write failed", dest, errno);
-            if (report->error_count >= MAX_ERRORS) break;
+    ssize_t bytes_read;
+    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
+        size_t offset = 0;
+        while (offset < (size_t)bytes_read) {
+            ssize_t written = write(temp_fd, buffer + offset,
+                                    (size_t)bytes_read - offset);
+            if (written > 0) {
+                offset += (size_t)written;
+            } else if (written < 0 && errno == EINTR) {
+                continue;
+            } else {
+                copy_error = written == 0 ? EIO : errno;
+                break;
+            }
+        }
+        if (copy_error) break;
+    }
+    if (bytes_read < 0 && !copy_error) copy_error = errno;
+
+    /* Finish writing the new contents before replacing the old file. */
+    if (!copy_error && fsync(temp_fd) < 0) copy_error = errno;
+    if (close(temp_fd) < 0 && !copy_error) copy_error = errno;
+    close(src_fd);
+
+    if (!copy_error) {
+        /* Recheck the destination in case it changed during copying. */
+        if (fstatat(target_dirfd, filename, &dest_stat, AT_SYMLINK_NOFOLLOW) == 0) {
+            if (!S_ISREG(dest_stat.st_mode)) copy_error = EINVAL;
+        } else if (errno != ENOENT) {
+            copy_error = errno;
         }
     }
 
-    close(src_fd);
-    close(dest_fd); // cleanup
-    
-    if (bytes_read == -1) { 
-        record_error(report, "Read failed", src, errno);
-    } else if (bytes_written >= 0) {
-        report->files_copied++; // increment only if no errors
+    if (!copy_error && renameat(target_dirfd, temp_name, target_dirfd, filename) < 0)
+        copy_error = errno;
+
+    if (copy_error) {
+        unlinkat(target_dirfd, temp_name, 0);
+        record_error(report, "Copy failed", dest, copy_error);
+        return;
     }
+
+    report->files_copied++;
 }
 
 /* Handle full directory sync */
