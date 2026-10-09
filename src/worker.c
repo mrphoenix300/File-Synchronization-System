@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 
 #define BUFFER_SIZE 4096
 #define MAX_ERRORS 500 // max errors before we give up
@@ -46,10 +47,63 @@ static int make_file_path(char *out, size_t size,
     return n >= 0 && (size_t)n < size;
 }
 
-void copy_file(const char *src, const char *dest, SyncReport *report);
-void full_sync(const char *source, const char *target, SyncReport *report);
+/*
+ * Walk every directory component without following symlinks. Keep the final
+ * directory fd open and use *at() operations so path replacement cannot
+ * redirect file operations after validation.
+ */
+static int open_safe_directory(const char *path, int create_last) {
+    if (!path || !*path) { errno = EINVAL; return -1; }
+    size_t len = strlen(path);
+    if (len >= PATH_MAX) { errno = ENAMETOOLONG; return -1; }
+
+    char *copy = strdup(path);
+    if (!copy) return -1;
+
+    int dirfd = open(path[0] == '/' ? "/" : ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dirfd < 0) { free(copy); return -1; }
+
+    char *saveptr = NULL;
+    char *part = strtok_r(copy, "/", &saveptr);
+    while (part) {
+        if (strcmp(part, "..") == 0) {
+            errno = EINVAL;
+            goto failed;
+        }
+        if (strcmp(part, ".") == 0) {
+            part = strtok_r(NULL, "/", &saveptr);
+            continue;
+        }
+
+        char *next = strtok_r(NULL, "/", &saveptr);
+        int fd = openat(dirfd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0 && errno == ENOENT && create_last && !next) {
+            if (mkdirat(dirfd, part, 0755) < 0 && errno != EEXIST) goto failed;
+            fd = openat(dirfd, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
+        if (fd < 0) goto failed;
+        close(dirfd);
+        dirfd = fd;
+        part = next;
+    }
+
+    free(copy);
+    return dirfd;
+
+failed:;
+    int saved_errno = errno;
+    close(dirfd);
+    free(copy);
+    errno = saved_errno;
+    return -1;
+}
+
+void copy_file(int source_dirfd, int target_dirfd, const char *filename,
+               const char *src, const char *dest, SyncReport *report);
+void full_sync(int source_dirfd, int target_dirfd, const char *source,
+               const char *target, SyncReport *report);
 void generate_report(const SyncReport *report, const char *operation, const char *filename);
-void create_target_directory(const char *path);
+
 
 
 
@@ -62,36 +116,53 @@ int main(int argc, char *argv[]) {
     SyncReport report = {0}; // init report
     const char *operation = argv[4];
     
-    create_target_directory(argv[2]); // make sure target exists
+    int source_dirfd = open_safe_directory(argv[1], 0);
+    if (source_dirfd < 0) {
+        record_error(&report, "Unsafe source directory", argv[1], errno);
+        generate_report(&report, operation, argv[3]);
+        return EXIT_FAILURE;
+    }
+    int target_dirfd = open_safe_directory(argv[2], 1);
+    if (target_dirfd < 0) {
+        record_error(&report, "Unsafe target directory", argv[2], errno);
+        close(source_dirfd);
+        generate_report(&report, operation, argv[3]);
+        return EXIT_FAILURE;
+    }
 
     if (strcmp(operation, "FULL") == 0) { // full sync mode
-        full_sync(argv[1], argv[2], &report);
+        full_sync(source_dirfd, target_dirfd, argv[1], argv[2], &report);
     } else { // single file operation
         char src_path[PATH_MAX], dest_path[PATH_MAX];
         if (!valid_filename(argv[3]) ||
             !make_file_path(src_path, sizeof(src_path), argv[1], argv[3]) ||
             !make_file_path(dest_path, sizeof(dest_path), argv[2], argv[3])) {
             record_error(&report, "Invalid filename or path", argv[3], EINVAL);
+            close(source_dirfd);
+            close(target_dirfd);
             generate_report(&report, operation, argv[3]);
             return EXIT_FAILURE;
         }
 
         if (strcmp(operation, "DELETED") == 0) { // delete operation
-            if (unlink(dest_path) == -1) { // try remove
+            if (unlinkat(target_dirfd, argv[3], 0) == -1) { // try remove
                 record_error(&report, "Delete failed", dest_path, errno);
             }
         } else { // copy/update
-            copy_file(src_path, dest_path, &report);
+            copy_file(source_dirfd, target_dirfd, argv[3], src_path, dest_path, &report);
         }
     }
 
+    close(source_dirfd);
+    close(target_dirfd);
     generate_report(&report, operation, argv[3]);
     return report.error_count > 0 ? EXIT_FAILURE : EXIT_SUCCESS; // exit code based on errors
 }
 
  /* The meat - copy file contents */
-void copy_file(const char *src, const char *dest, SyncReport *report) {
-    int src_fd = open(src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+void copy_file(int source_dirfd, int target_dirfd, const char *filename,
+               const char *src, const char *dest, SyncReport *report) {
+    int src_fd = openat(source_dirfd, filename, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (src_fd == -1) {
         record_error(report, "Open failed", src, errno);
         if (report->error_count >= MAX_ERRORS) return;
@@ -105,7 +176,8 @@ void copy_file(const char *src, const char *dest, SyncReport *report) {
         return;
     }
 
-    int dest_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_NONBLOCK, 0644); // rw-r--r--
+    int dest_fd = openat(target_dirfd, filename,
+                         O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0644); // rw-r--r--
     if (dest_fd == -1) {
         record_error(report, "Create failed", dest, errno);
         close(src_fd);
@@ -144,8 +216,9 @@ void copy_file(const char *src, const char *dest, SyncReport *report) {
 }
 
 /* Handle full directory sync */
-void full_sync(const char *source, const char *target, SyncReport *report) {
-    DIR *dir = opendir(source);
+void full_sync(int source_dirfd, int target_dirfd, const char *source,
+               const char *target, SyncReport *report) {
+    DIR *dir = fdopendir(dup(source_dirfd));
     if (!dir) {
         record_error(report, "Dir open failed", source, errno);
         return;
@@ -166,7 +239,7 @@ void full_sync(const char *source, const char *target, SyncReport *report) {
         }
 
         int prev_errors = report->error_count;
-        copy_file(src_path, dest_path, report);
+        copy_file(source_dirfd, target_dirfd, entry->d_name, src_path, dest_path, report);
         
         if (report->error_count > prev_errors) {
             report->files_skipped++; // tally skips
@@ -218,9 +291,3 @@ void generate_report(const SyncReport *report, const char *operation, const char
     printf("EXEC_REPORT_END\n");
 }
 
-/* Create target dir if needed */
-void create_target_directory(const char *path) {
-    if (mkdir(path, 0755) == -1 && errno != EEXIST) {
-        fprintf(stderr, "Failed to create directory: %s\n", path);
-    }
-}
