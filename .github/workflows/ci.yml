@@ -1,0 +1,53 @@
+name: C build and smoke tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with AddressSanitizer and UndefinedBehaviorSanitizer
+        run: |
+          make clean
+          make CFLAGS="-Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude" LDFLAGS="-fsanitize=address,undefined"
+      - name: Worker smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ASAN_OPTIONS="detect_leaks=0"
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          mkdir -p "$root/source" "$root/target"
+          printf 'SYNC TEST\n' > "$root/source/test.txt"
+          ./bin/worker "$root/source" "$root/target" test.txt MODIFIED > "$root/success.log"
+          grep -q 'STATUS: SUCCESS' "$root/success.log"
+          cmp "$root/source/test.txt" "$root/target/test.txt"
+          printf 'PRESERVE\n' > "$root/target/protected.txt"
+          if ./bin/worker "$root/source" "$root/target" protected.txt MODIFIED > "$root/error.log"; then
+            echo 'Expected missing-source copy to fail' >&2
+            exit 1
+          fi
+          grep -q 'STATUS: ERROR' "$root/error.log"
+          cmp <(printf 'PRESERVE\n') "$root/target/protected.txt"
+          printf 'DO NOT CHANGE\n' > "$root/outside.txt"
+          ln -s "$root/outside.txt" "$root/target/link.txt"
+          printf 'NEW DATA\n' > "$root/source/link.txt"
+          if ./bin/worker "$root/source" "$root/target" link.txt MODIFIED > "$root/symlink.log"; then
+            echo 'Expected symlink destination to be rejected' >&2
+            exit 1
+          fi
+          grep -q 'STATUS: ERROR' "$root/symlink.log"
+          cmp <(printf 'DO NOT CHANGE\n') "$root/outside.txt"
+          if ./bin/worker "$root/source" "$root/target" ../outside.txt MODIFIED > "$root/traversal.log"; then
+            echo 'Expected traversal to be rejected' >&2
+            exit 1
+          fi
+          grep -q 'STATUS: ERROR' "$root/traversal.log"
