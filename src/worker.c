@@ -146,7 +146,7 @@ void generate_report(const SyncReport *report, const char *operation, const char
     const char *status;
     if (report->error_count == 0) {
         status = "SUCCESS";
-    } else if (report->files_copied > 0 || report->files_skipped < report->error_count) {
+    } else if (report->files_copied > 0) {
         status = "PARTIAL";
     } else {
         status = "ERROR";
