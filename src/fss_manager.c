@@ -91,16 +91,21 @@ int main(int argc, char *argv[]) {
         struct timeval timeout = {.tv_sec = 1}; // Check every second
         int ready = select(FD_SETSIZE, &read_fds, NULL, NULL, &timeout);
 
-        if (ready == -1 && errno != EINTR) {
-            perror("select() had a bad day");
+        if (ready == -1) {
+            if (errno == EINTR) continue;
+            perror("select");
             break;
         }
+        if (ready == 0) continue;
 
         // Handle file system events
         if (FD_ISSET(inotify_fd, &read_fds)) {
             char event_buffer[BUF_LEN];
             ssize_t bytes_read = read(inotify_fd, event_buffer, BUF_LEN);
-            for (char *ptr = event_buffer; ptr < event_buffer + bytes_read; ) {
+            if (bytes_read < 0) {
+                if (errno != EAGAIN && errno != EINTR)
+                    perror("read(inotify)");
+            } else for (char *ptr = event_buffer; ptr < event_buffer + bytes_read; ) {
                 struct inotify_event *event = (struct inotify_event *)ptr;
                 handle_inotify_event(event);
                 ptr += EVENT_SIZE + event->len;
@@ -286,14 +291,20 @@ void start_worker(const char *source, const char *target, const char *filename, 
 
     } else {
         perror("fork");
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
     }
 }
 
 /* Process worker's final report - detective work */
 void process_worker_report(int pipe_fd, const char *source, const char *target, const char *operation, pid_t pid) {
 
-    char report[BUFFER_SIZE];
-    ssize_t bytes_read = read(pipe_fd, report, sizeof(report) - 1);
+    char report[BUFFER_SIZE] = {0};
+    ssize_t bytes_read;
+    do {
+        bytes_read = read(pipe_fd, report, sizeof(report) - 1);
+    } while (bytes_read < 0 && errno == EINTR);
+    if (bytes_read < 0) perror("read(worker report)");
     SyncInfo *job = find_sync_info(source, NULL);
     time_t now = time(NULL);
     char timestamp[TS_LEN + 1];
@@ -324,7 +335,7 @@ void process_worker_report(int pipe_fd, const char *source, const char *target, 
         }
     }
 
-    if (job) {
+    if (job && bytes_read > 0) {
         job->last_sync = now;
         if (strstr(report, "ERROR") || strstr(report, "PARTIAL")) {
             // Count errors
