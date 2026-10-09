@@ -296,61 +296,84 @@ void start_worker(const char *source, const char *target, const char *filename, 
     }
 }
 
-/* Process worker's final report - detective work */
+/* Read a complete worker report, with a bounded memory footprint. */
 void process_worker_report(int pipe_fd, const char *source, const char *target, const char *operation, pid_t pid) {
+    enum { MAX_REPORT_SIZE = 32768 };
+    char report[MAX_REPORT_SIZE + 1];
+    size_t used = 0;
+    int truncated = 0;
+    int read_error = 0;
 
-    char report[BUFFER_SIZE] = {0};
-    ssize_t bytes_read;
-    do {
-        bytes_read = read(pipe_fd, report, sizeof(report) - 1);
-    } while (bytes_read < 0 && errno == EINTR);
-    if (bytes_read < 0) perror("read(worker report)");
+    for (;;) {
+        char chunk[BUFFER_SIZE];
+        ssize_t n = read(pipe_fd, chunk, sizeof(chunk));
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            read_error = errno;
+            break;
+        }
+        size_t count = (size_t)n;
+        size_t available = MAX_REPORT_SIZE - used;
+        size_t keep = count < available ? count : available;
+        memcpy(report + used, chunk, keep);
+        used += keep;
+        if (keep != count) truncated = 1;
+        /* Keep draining the pipe to EOF even when the report is too long. */
+    }
+    close(pipe_fd);
+    report[used] = '\0';
+
     SyncInfo *job = find_sync_info(source, NULL);
     time_t now = time(NULL);
     char timestamp[TS_LEN + 1];
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", localtime(&now));
 
-    if (bytes_read > 0) {
-        report[bytes_read] = '\0';
-        char *status = "UNKNOWN";
-        char details[512] = "No details";
-        
-        // Parse the worker's report
-        char *line = strtok(report, "\n");
-        while (line != NULL) {
-            if (strncmp(line, "STATUS: ", 7) == 0) {
-                status = line + 7;  // Skip prefix
+    char status[32] = "UNKNOWN";
+    char details[512] = "No details";
+    int errors_reported = 0;
+    int in_errors = 0;
+    int has_end_marker = 0;
+    if (!truncated && !read_error && used > 0) {
+        char *saveptr = NULL;
+        for (char *line = strtok_r(report, "\n", &saveptr);
+             line != NULL; line = strtok_r(NULL, "\n", &saveptr)) {
+            if (strcmp(line, "EXEC_REPORT_END") == 0) {
+                has_end_marker = 1;
+                break;
+            }
+            if (strncmp(line, "STATUS: ", 8) == 0) {
+                snprintf(status, sizeof(status), "%s", line + 8);
             } else if (strncmp(line, "DETAILS: ", 9) == 0) {
-                strncpy(details, line + 9, sizeof(details) - 1);
+                snprintf(details, sizeof(details), "%s", line + 9);
+            } else if (strcmp(line, "ERRORS:") == 0) {
+                in_errors = 1;
+            } else if (in_errors && strncmp(line, "- ", 2) == 0) {
+                errors_reported++;
             }
-            line = strtok(NULL, "\n");
-        }
-
-        // Log the drama
-        FILE *log = fopen(manager_logfile, "a");
-        if (log) {
-            fprintf(log, "[%s] [%s] [%s] [%d] [%s] [%s] [%s]\n", 
-                    timestamp, source, target, pid, operation, status, details);
-            fclose(log);
         }
     }
 
-    if (job && bytes_read > 0) {
+    if (truncated || read_error || !has_end_marker) {
+        snprintf(status, sizeof(status), "ERROR");
+        snprintf(details, sizeof(details), "%s",
+                 truncated ? "Worker report exceeded 32768 bytes" :
+                 read_error ? "Worker report read failed" : "Worker report incomplete");
+        if (errors_reported == 0) errors_reported = 1;
+    }
+
+    FILE *log = fopen(manager_logfile, "a");
+    if (log) {
+        fprintf(log, "[%s] [%s] [%s] [%d] [%s] [%s] [%s]\n",
+                timestamp, source, target, pid, operation, status, details);
+        fclose(log);
+    }
+
+    if (job) {
         job->last_sync = now;
-        if (strstr(report, "ERROR") || strstr(report, "PARTIAL")) {
-            // Count errors
-            char *error_start = strstr(report, "ERRORS:");
-            if (error_start) {
-                char *line = strtok(error_start, "\n");
-                while (line) {
-                    job->error_count++;
-                    line = strtok(NULL, "\n");
-                }
-            }
-        }
+        if (strcmp(status, "ERROR") == 0 || strcmp(status, "PARTIAL") == 0)
+            job->error_count += errors_reported > 0 ? errors_reported : 1;
     }
-    
-    close(pipe_fd);
 }
 
 /* Handle signals - don't ignore the universe */
